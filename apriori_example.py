@@ -9,7 +9,7 @@ def get_frequent_itemsets(transactions, min_support):
 
     transactions_count = len(transactions)
     frequent_itemsets = {
-        frozenset([item]): count
+        item: count
         for item, count in item_counts.items()
         if count / transactions_count >= min_support
     }
