@@ -1,11 +1,11 @@
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, f1_score, precision_score, recall_score, silhouette_score
 from sklearn.svm import SVC
 import warnings
 warnings.filterwarnings('ignore')
@@ -55,7 +55,8 @@ def advanced_feature_engineering(df):
         Distinct_Products=('product_id', 'nunique'),
         Age=('age', 'first'),
         Gender=('gender', 'first'),
-        State=('state', 'first')
+        State=('state', 'first'),
+        Customer_Name=('customer_name', 'first')
     ).reset_index()
     
     first_order_info = pre_df.sort_values(['order_date', 'order_id']).groupby('customer_id')[['order_id']].first().reset_index()
@@ -100,11 +101,38 @@ def advanced_feature_engineering(df):
     return customer_data
 
 def apply_customer_kmeans(customer_data):
-    cluster_features = customer_data[['Recency', 'Frequency', 'Monetary', 'Age']]
-    scaler = StandardScaler()
+    cluster_features = customer_data[['Recency', 'Frequency', 'Monetary', 'Age', 'Distinct_Products',
+                                      'First_Order_Value', 'First_Order_Items', 'Momentum_30d_Spend']].copy()
+
+    for col in ['Recency', 'Frequency', 'Monetary', 'Age', 'Distinct_Products',
+                'First_Order_Value', 'First_Order_Items', 'Momentum_30d_Spend']:
+        cluster_features[col] = np.log1p(cluster_features[col].fillna(0))
+
+    scaler = RobustScaler()
     scaled_features = scaler.fit_transform(cluster_features)
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    customer_data['Cluster_ID'] = kmeans.fit_predict(scaled_features)
+
+    best_score = -1
+    best_labels = None
+    best_n_clusters = 2
+    best_model_name = 'kmeans'
+
+    for n_clusters in range(2, 7):
+        candidate_models = [
+            ('kmeans', KMeans(n_clusters=n_clusters, random_state=42, n_init=50)),
+            ('minibatch', MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=256, n_init=20))
+        ]
+
+        for model_name, model in candidate_models:
+            labels = model.fit_predict(scaled_features)
+            score = silhouette_score(scaled_features, labels)
+            if score > best_score:
+                best_score = score
+                best_labels = labels
+                best_n_clusters = n_clusters
+                best_model_name = model_name
+
+    customer_data['Cluster_ID'] = best_labels
+    print(f"  Selected customer clustering: {best_model_name} with {best_n_clusters} clusters (Silhouette Score: {best_score:.4f})")
     return customer_data
 
 def train_persona_classifier(customer_data):
@@ -128,24 +156,35 @@ def train_persona_classifier(customer_data):
         print(f"  -> Accuracy: {accuracy_score(y_test, preds):.2%}")
         print("  -> Classification Report:")
         print(classification_report(y_test, preds, zero_division=0))
+        return f1_score(y_test, preds, average='macro', zero_division=0)
     
+    persona_results = []
+
     lr_base = LogisticRegression(random_state=42, max_iter=2000, class_weight='balanced')
     param_grid_lr = {'C': [0.001, 0.01, 0.1, 1, 10, 100]}
     lr_tuned = RandomizedSearchCV(lr_base, param_grid_lr, n_iter=6, cv=3, random_state=42, scoring='f1_macro', n_jobs=-1)
     lr_tuned.fit(X_train_scaled, y_train)
-    print_persona_metrics("Tuned Logistic Regression", lr_tuned.predict(X_test_scaled), lr_tuned.best_params_)
+    lr_f1 = print_persona_metrics("Tuned Logistic Regression", lr_tuned.predict(X_test_scaled), lr_tuned.best_params_)
+    persona_results.append({'name': 'Tuned Logistic Regression', 'model': lr_tuned, 'scaler': scaler, 'use_scaled': True, 'score': lr_f1})
     
     svm_base = SVC(class_weight='balanced', random_state=42)
     param_grid_svm = {'C': [0.1, 1, 10, 50], 'gamma': ['scale', 'auto', 0.1, 0.01], 'kernel': ['rbf']}
     svm_tuned = RandomizedSearchCV(svm_base, param_grid_svm, n_iter=8, cv=3, random_state=42, scoring='f1_macro', n_jobs=-1)
     svm_tuned.fit(X_train_scaled, y_train)
-    print_persona_metrics("Tuned SVM (RBF)", svm_tuned.predict(X_test_scaled), svm_tuned.best_params_)
+    svm_f1 = print_persona_metrics("Tuned SVM (RBF)", svm_tuned.predict(X_test_scaled), svm_tuned.best_params_)
+    persona_results.append({'name': 'Tuned SVM (RBF)', 'model': svm_tuned, 'scaler': scaler, 'use_scaled': True, 'score': svm_f1})
     
     rf_base = RandomForestClassifier(class_weight='balanced', random_state=42)
     param_grid_rf = {'n_estimators': [100, 200], 'max_depth': [None, 5, 10], 'min_samples_split': [2, 5]}
     rf_tuned = RandomizedSearchCV(rf_base, param_grid_rf, n_iter=8, cv=3, random_state=42, scoring='f1_macro', n_jobs=-1)
     rf_tuned.fit(X_train, y_train)
-    print_persona_metrics("Tuned Random Forest", rf_tuned.predict(X_test), rf_tuned.best_params_)
+    rf_preds = rf_tuned.predict(X_test)
+    rf_f1 = print_persona_metrics("Tuned Random Forest", rf_preds, rf_tuned.best_params_)
+    persona_results.append({'name': 'Tuned Random Forest', 'model': rf_tuned, 'scaler': None, 'use_scaled': False, 'score': rf_f1})
+
+    best_persona = max(persona_results, key=lambda x: x['score'])
+    print(f"\nBest persona classifier: {best_persona['name']} (Macro F1: {best_persona['score']:.2%})")
+    return best_persona, feature_cols
 
 def train_churn_predictor(customer_data):
     print("\n--- 2. CHURN PREDICTOR (90-Day Window: Core Features) ---")
@@ -179,7 +218,9 @@ def train_churn_predictor(customer_data):
         print(f"  -> Recall:    {recall_score(y_true, preds, zero_division=0):.2%}")
         print(f"  -> F1-Score:  {f1_score(y_true, preds, zero_division=0):.2%}")
         print(f"  -> ROC-AUC:   {roc_auc_score(y_true, probs):.2%}")
-    
+
+    churn_results = []
+
     lr_base = LogisticRegression(random_state=42, max_iter=2000)
     param_grid_lr = {'C': [0.001, 0.01, 0.1, 1, 10, 100], 'penalty': ['l2']}
     lr_tuned = RandomizedSearchCV(lr_base, param_grid_lr, n_iter=6, cv=3, random_state=42, scoring='f1', n_jobs=-1)
@@ -187,6 +228,7 @@ def train_churn_predictor(customer_data):
     lr_preds = lr_tuned.predict(X_test_scaled)
     lr_probs = lr_tuned.predict_proba(X_test_scaled)[:, 1]
     print_metrics("Tuned Logistic Regression", y_test, lr_preds, lr_probs, lr_tuned.best_params_)
+    churn_results.append({'name': 'Tuned Logistic Regression', 'model': lr_tuned, 'scaler': scaler, 'use_scaled': True, 'score': f1_score(y_test, lr_preds, zero_division=0)})
     
     svm_base = SVC(probability=True, random_state=42, kernel='rbf')
     param_grid_svm = {'C': [0.1, 1, 10, 50], 'gamma': ['scale', 'auto', 0.1, 0.01]}
@@ -195,6 +237,7 @@ def train_churn_predictor(customer_data):
     svm_preds = svm_tuned.predict(X_test_scaled)
     svm_probs = svm_tuned.predict_proba(X_test_scaled)[:, 1]
     print_metrics("Tuned SVM (RBF)", y_test, svm_preds, svm_probs, svm_tuned.best_params_)
+    churn_results.append({'name': 'Tuned SVM (RBF)', 'model': svm_tuned, 'scaler': scaler, 'use_scaled': True, 'score': f1_score(y_test, svm_preds, zero_division=0)})
     
     rf_base = RandomForestClassifier(random_state=42)
     param_grid_rf = {
@@ -208,11 +251,143 @@ def train_churn_predictor(customer_data):
     rf_preds = rf_tuned.predict(X_test)
     rf_probs = rf_tuned.predict_proba(X_test)[:, 1]
     print_metrics("Tuned Random Forest", y_test, rf_preds, rf_probs, rf_tuned.best_params_)
+    churn_results.append({'name': 'Tuned Random Forest', 'model': rf_tuned, 'scaler': None, 'use_scaled': False, 'score': f1_score(y_test, rf_preds, zero_division=0)})
+
+    best_churn = max(churn_results, key=lambda x: x['score'])
+    print(f"\nBest churn model: {best_churn['name']} (F1: {best_churn['score']:.2%})")
+    return best_churn, feature_cols
+    
+    churn_results = []
+
+    lr_base = LogisticRegression(random_state=42, max_iter=2000)
+    param_grid_lr = {'C': [0.001, 0.01, 0.1, 1, 10, 100], 'penalty': ['l2']}
+    lr_tuned = RandomizedSearchCV(lr_base, param_grid_lr, n_iter=6, cv=3, random_state=42, scoring='f1', n_jobs=-1)
+    lr_tuned.fit(X_train_scaled, y_train)
+    lr_preds = lr_tuned.predict(X_test_scaled)
+    lr_probs = lr_tuned.predict_proba(X_test_scaled)[:, 1]
+    print_metrics("Tuned Logistic Regression", y_test, lr_preds, lr_probs, lr_tuned.best_params_)
+    churn_results.append({'name': 'Tuned Logistic Regression', 'model': lr_tuned, 'scaler': scaler, 'use_scaled': True, 'score': f1_score(y_test, lr_preds, zero_division=0)})
+    
+    svm_base = SVC(probability=True, random_state=42, kernel='rbf')
+    param_grid_svm = {'C': [0.1, 1, 10, 50], 'gamma': ['scale', 'auto', 0.1, 0.01]}
+    svm_tuned = RandomizedSearchCV(svm_base, param_grid_svm, n_iter=8, cv=3, random_state=42, scoring='f1', n_jobs=-1)
+    svm_tuned.fit(X_train_scaled, y_train)
+    svm_preds = svm_tuned.predict(X_test_scaled)
+    svm_probs = svm_tuned.predict_proba(X_test_scaled)[:, 1]
+    print_metrics("Tuned SVM (RBF)", y_test, svm_preds, svm_probs, svm_tuned.best_params_)
+    churn_results.append({'name': 'Tuned SVM (RBF)', 'model': svm_tuned, 'scaler': scaler, 'use_scaled': True, 'score': f1_score(y_test, svm_preds, zero_division=0)})
+    
+    rf_base = RandomForestClassifier(random_state=42)
+    param_grid_rf = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [None, 5, 10, 15],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    rf_tuned = RandomizedSearchCV(rf_base, param_grid_rf, n_iter=10, cv=3, random_state=42, scoring='f1', n_jobs=-1)
+    rf_tuned.fit(X_train, y_train)
+    rf_preds = rf_tuned.predict(X_test)
+    rf_probs = rf_tuned.predict_proba(X_test)[:, 1]
+    print_metrics("Tuned Random Forest", y_test, rf_preds, rf_probs, rf_tuned.best_params_)
+    churn_results.append({'name': 'Tuned Random Forest', 'model': rf_tuned, 'scaler': None, 'use_scaled': False, 'score': f1_score(y_test, rf_preds, zero_division=0)})
+
+    best_churn = max(churn_results, key=lambda x: x['score'])
+    print(f"\nBest churn model: {best_churn['name']} (F1: {best_churn['score']:.2%})")
+    return best_churn, feature_cols
+
+def predict_model_probability(model_info, X):
+    X_input = X.copy()
+    if model_info['use_scaled']:
+        X_input = model_info['scaler'].transform(X_input)
+    if hasattr(model_info['model'], 'predict_proba'):
+        return model_info['model'].predict_proba(X_input)[:, 1]
+    if hasattr(model_info['model'], 'decision_function'):
+        scores = model_info['model'].decision_function(X_input)
+        return (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    return model_info['model'].predict(X_input)
+
+
+def print_business_insights(df, products_df, customer_data, churn_model_info, churn_feature_cols):
+    print("\n--- 3. BUSINESS INSIGHTS ---")
+    product_sales = df.groupby('product_id').agg(
+        Total_Quantity_Sold=('quantity', 'sum'),
+        Total_Revenue=('total_price', 'sum')
+    ).reset_index()
+    product_sales = pd.merge(product_sales, products_df.rename(columns={'quantity': 'Stock'}), on='product_id', how='right')
+    product_sales['Total_Quantity_Sold'] = product_sales['Total_Quantity_Sold'].fillna(0)
+    product_sales['Total_Revenue'] = product_sales['Total_Revenue'].fillna(0)
+    product_sales['Sell_Through'] = product_sales['Total_Quantity_Sold'] / (product_sales['Stock'].replace(0, np.nan))
+    product_sales['Sell_Through'] = product_sales['Sell_Through'].fillna(0)
+
+    best_products = product_sales.sort_values('Total_Revenue', ascending=False).head(5)
+    attention_products = product_sales[product_sales['Stock'] > 0].sort_values(['Total_Revenue', 'Total_Quantity_Sold']).head(5)
+
+    customer_business = customer_data.copy()
+    if 'customer_name' not in customer_business.columns:
+        customer_business = pd.merge(customer_business, df[['customer_id', 'customer_name']].drop_duplicates(), on='customer_id', how='left')
+    customer_business['Predicted_Churn_Prob'] = predict_model_probability(churn_model_info, customer_business[churn_feature_cols])
+    customer_business['Predicted_Churn_Label'] = (customer_business['Predicted_Churn_Prob'] >= 0.5).astype(int)
+
+    top_customers = customer_business.sort_values('Monetary', ascending=False).head(5)
+    risky_customers = customer_business[customer_business['Predicted_Churn_Prob'] >= 0.6].sort_values(['Predicted_Churn_Prob', 'Monetary'], ascending=[False, False]).head(5)
+
+    print("\nTop 5 customers by historical revenue:")
+    for _, row in top_customers.iterrows():
+        print(f"  {row.get('Customer_Name', row.get('customer_name','ID '+str(int(row['customer_id']))))}: ${row['Monetary']:.2f} historical spend, churn prob {row['Predicted_Churn_Prob']:.2%}")
+
+    if not risky_customers.empty:
+        print("\nPotentially harmful customers (high churn probability + high spend):")
+        for _, row in risky_customers.iterrows():
+            print(f"  {row.get('Customer_Name', row.get('customer_name','ID '+str(int(row['customer_id']))))}: ${row['Monetary']:.2f} spend, churn prob {row['Predicted_Churn_Prob']:.2%}")
+    else:
+        print("\nNo high-risk revenue customers were detected above the 60% churn-probability threshold.")
+
+    cluster_summary = customer_business.groupby('Cluster_ID').agg(
+        Customers=('customer_id', 'count'),
+        Avg_Monetary=('Monetary', 'mean'),
+        Avg_Future_Spend=('Future_Spend', 'mean'),
+        Avg_Predicted_Churn=('Predicted_Churn_Prob', 'mean'),
+        Actual_Churn_Rate=('Churn', 'mean')
+    ).reset_index().sort_values(['Avg_Future_Spend', 'Avg_Monetary'], ascending=False)
+
+    best_cluster = cluster_summary.iloc[0]
+    print(f"\nBest customer group for business: Cluster {int(best_cluster['Cluster_ID'])}")
+    print(f"  Customers: {int(best_cluster['Customers'])}")
+    print(f"  Avg Monetary Spend: ${best_cluster['Avg_Monetary']:.2f}")
+    print(f"  Avg Future Spend: ${best_cluster['Avg_Future_Spend']:.2f}")
+    print(f"  Avg Predicted Churn Probability: {best_cluster['Avg_Predicted_Churn']:.2%}")
+    print(f"  Actual Churn Rate: {best_cluster['Actual_Churn_Rate']:.2%}")
+
+    print("\nTop 5 product sellers by revenue:")
+    for _, row in best_products.iterrows():
+        print(f"  {row['product_name']} ({row['product_type']}): ${row['Total_Revenue']:.2f} revenue, {int(row['Total_Quantity_Sold'])} units sold")
+
+    print("\nProducts needing attention (low sales, stock remaining):")
+    for _, row in attention_products.iterrows():
+        print(f"  {row['product_name']} ({row['product_type']}): ${row['Total_Revenue']:.2f} revenue, {int(row['Total_Quantity_Sold'])} sold, {int(row['Stock'])} stock")
+
+    age_bins = [0, 25, 35, 45, 55, 100]
+    customer_business['Age_Band'] = pd.cut(customer_business['Age'], age_bins)
+    age_summary = customer_business.groupby('Age_Band').agg(
+        Customers=('customer_id', 'count'),
+        Avg_Monetary=('Monetary', 'mean'),
+        Churn_Rate=('Churn', 'mean')
+    ).reset_index().sort_values('Avg_Monetary', ascending=False)
+
+    top_age = age_summary.iloc[0]
+    print(f"\nHighest value age segment: {top_age['Age_Band']} with avg spend ${top_age['Avg_Monetary']:.2f} and churn {top_age['Churn_Rate']:.2%}")
+
+    high_risk_count = int((customer_business['Predicted_Churn_Prob'] >= 0.7).sum())
+    low_risk_count = int((customer_business['Predicted_Churn_Prob'] <= 0.3).sum())
+    print(f"\nPredicted at-risk segment: {high_risk_count} customers with churn probability >= 70%.")
+    print(f"Predicted safest segment: {low_risk_count} customers with churn probability <= 30%.")
 
 if __name__ == "__main__":
     df = load_and_merge_data()
+    products_df = pd.read_csv('products 2.csv')
     customer_data = advanced_feature_engineering(df)
     customer_data = apply_customer_kmeans(customer_data)
     
-    train_persona_classifier(customer_data)
-    train_churn_predictor(customer_data)
+    persona_model_info, persona_feature_cols = train_persona_classifier(customer_data)
+    churn_model_info, churn_feature_cols = train_churn_predictor(customer_data)
+    print_business_insights(df, products_df, customer_data, churn_model_info, churn_feature_cols)
