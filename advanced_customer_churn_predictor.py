@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import RandomForestClassifier
@@ -10,11 +11,18 @@ from sklearn.svm import SVC
 import warnings
 warnings.filterwarnings('ignore')
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _data_path(filename):
+    return BASE_DIR / filename
+
+
 def load_and_merge_data():
     print("Loading data...")
-    customers = pd.read_csv('customers 2.csv')
-    orders = pd.read_csv('orders 2.csv')
-    sales = pd.read_csv('sales 2.csv')
+    customers = pd.read_csv(_data_path('customers 2.csv'))
+    orders = pd.read_csv(_data_path('orders 2.csv'))
+    sales = pd.read_csv(_data_path('sales 2.csv'))
     
     df = pd.merge(sales, orders, on='order_id', how='inner')
     df = pd.merge(df, customers, on='customer_id', how='inner')
@@ -307,8 +315,7 @@ def predict_model_probability(model_info, X):
     return model_info['model'].predict(X_input)
 
 
-def print_business_insights(df, products_df, customer_data, churn_model_info, churn_feature_cols):
-    print("\n--- 3. BUSINESS INSIGHTS ---")
+def build_business_insight_tables(df, products_df, customer_data, churn_model_info, churn_feature_cols):
     product_sales = df.groupby('product_id').agg(
         Total_Quantity_Sold=('quantity', 'sum'),
         Total_Revenue=('total_price', 'sum')
@@ -319,8 +326,8 @@ def print_business_insights(df, products_df, customer_data, churn_model_info, ch
     product_sales['Sell_Through'] = product_sales['Total_Quantity_Sold'] / (product_sales['Stock'].replace(0, np.nan))
     product_sales['Sell_Through'] = product_sales['Sell_Through'].fillna(0)
 
-    best_products = product_sales.sort_values('Total_Revenue', ascending=False).head(5)
-    attention_products = product_sales[product_sales['Stock'] > 0].sort_values(['Total_Revenue', 'Total_Quantity_Sold']).head(5)
+    best_products = product_sales.sort_values('Total_Revenue', ascending=False).head(5).copy()
+    attention_products = product_sales[product_sales['Stock'] > 0].sort_values(['Total_Revenue', 'Total_Quantity_Sold']).head(5).copy()
 
     customer_business = customer_data.copy()
     if 'customer_name' not in customer_business.columns:
@@ -328,8 +335,55 @@ def print_business_insights(df, products_df, customer_data, churn_model_info, ch
     customer_business['Predicted_Churn_Prob'] = predict_model_probability(churn_model_info, customer_business[churn_feature_cols])
     customer_business['Predicted_Churn_Label'] = (customer_business['Predicted_Churn_Prob'] >= 0.5).astype(int)
 
-    top_customers = customer_business.sort_values('Monetary', ascending=False).head(5)
-    risky_customers = customer_business[customer_business['Predicted_Churn_Prob'] >= 0.6].sort_values(['Predicted_Churn_Prob', 'Monetary'], ascending=[False, False]).head(5)
+    top_customers = customer_business.sort_values('Monetary', ascending=False).head(5).copy()
+    risky_customers = customer_business[customer_business['Predicted_Churn_Prob'] >= 0.6].sort_values(['Predicted_Churn_Prob', 'Monetary'], ascending=[False, False]).head(5).copy()
+
+    cluster_summary = customer_business.groupby('Cluster_ID').agg(
+        Customers=('customer_id', 'count'),
+        Avg_Monetary=('Monetary', 'mean'),
+        Avg_Future_Spend=('Future_Spend', 'mean'),
+        Avg_Predicted_Churn=('Predicted_Churn_Prob', 'mean'),
+        Actual_Churn_Rate=('Churn', 'mean')
+    ).reset_index().sort_values(['Avg_Future_Spend', 'Avg_Monetary'], ascending=False)
+
+    age_bins = [0, 25, 35, 45, 55, 100]
+    customer_business['Age_Band'] = pd.cut(customer_business['Age'], age_bins)
+    age_summary = customer_business.groupby('Age_Band').agg(
+        Customers=('customer_id', 'count'),
+        Avg_Monetary=('Monetary', 'mean'),
+        Churn_Rate=('Churn', 'mean')
+    ).reset_index().sort_values('Avg_Monetary', ascending=False)
+
+    summary = {
+        'customer_count': int(customer_business['customer_id'].nunique()),
+        'churn_rate': float(customer_business['Churn'].mean()),
+        'cluster_count': int(customer_business['Cluster_ID'].nunique()),
+        'average_monetary': float(customer_business['Monetary'].mean()),
+        'high_risk_count': int((customer_business['Predicted_Churn_Prob'] >= 0.7).sum()),
+        'low_risk_count': int((customer_business['Predicted_Churn_Prob'] <= 0.3).sum()),
+    }
+
+    return {
+        'summary': pd.DataFrame([summary]),
+        'customers': top_customers.reset_index(drop=True),
+        'risky_customers': risky_customers.reset_index(drop=True),
+        'clusters': cluster_summary.reset_index(drop=True),
+        'products': best_products.reset_index(drop=True),
+        'attention_products': attention_products.reset_index(drop=True),
+        'age_segments': age_summary.reset_index(drop=True),
+    }
+
+
+def print_business_insights(df, products_df, customer_data, churn_model_info, churn_feature_cols):
+    print("\n--- 3. BUSINESS INSIGHTS ---")
+    insight_tables = build_business_insight_tables(df, products_df, customer_data, churn_model_info, churn_feature_cols)
+    summary = insight_tables['summary'].iloc[0]
+    top_customers = insight_tables['customers']
+    risky_customers = insight_tables['risky_customers']
+    cluster_summary = insight_tables['clusters']
+    best_products = insight_tables['products']
+    attention_products = insight_tables['attention_products']
+    age_summary = insight_tables['age_segments']
 
     print("\nTop 5 customers by historical revenue:")
     for _, row in top_customers.iterrows():
@@ -341,14 +395,6 @@ def print_business_insights(df, products_df, customer_data, churn_model_info, ch
             print(f"  {row.get('Customer_Name', row.get('customer_name','ID '+str(int(row['customer_id']))))}: ${row['Monetary']:.2f} spend, churn prob {row['Predicted_Churn_Prob']:.2%}")
     else:
         print("\nNo high-risk revenue customers were detected above the 60% churn-probability threshold.")
-
-    cluster_summary = customer_business.groupby('Cluster_ID').agg(
-        Customers=('customer_id', 'count'),
-        Avg_Monetary=('Monetary', 'mean'),
-        Avg_Future_Spend=('Future_Spend', 'mean'),
-        Avg_Predicted_Churn=('Predicted_Churn_Prob', 'mean'),
-        Actual_Churn_Rate=('Churn', 'mean')
-    ).reset_index().sort_values(['Avg_Future_Spend', 'Avg_Monetary'], ascending=False)
 
     best_cluster = cluster_summary.iloc[0]
     print(f"\nBest customer group for business: Cluster {int(best_cluster['Cluster_ID'])}")
@@ -366,28 +412,61 @@ def print_business_insights(df, products_df, customer_data, churn_model_info, ch
     for _, row in attention_products.iterrows():
         print(f"  {row['product_name']} ({row['product_type']}): ${row['Total_Revenue']:.2f} revenue, {int(row['Total_Quantity_Sold'])} sold, {int(row['Stock'])} stock")
 
-    age_bins = [0, 25, 35, 45, 55, 100]
-    customer_business['Age_Band'] = pd.cut(customer_business['Age'], age_bins)
-    age_summary = customer_business.groupby('Age_Band').agg(
-        Customers=('customer_id', 'count'),
-        Avg_Monetary=('Monetary', 'mean'),
-        Churn_Rate=('Churn', 'mean')
-    ).reset_index().sort_values('Avg_Monetary', ascending=False)
-
     top_age = age_summary.iloc[0]
     print(f"\nHighest value age segment: {top_age['Age_Band']} with avg spend ${top_age['Avg_Monetary']:.2f} and churn {top_age['Churn_Rate']:.2%}")
 
-    high_risk_count = int((customer_business['Predicted_Churn_Prob'] >= 0.7).sum())
-    low_risk_count = int((customer_business['Predicted_Churn_Prob'] <= 0.3).sum())
-    print(f"\nPredicted at-risk segment: {high_risk_count} customers with churn probability >= 70%.")
-    print(f"Predicted safest segment: {low_risk_count} customers with churn probability <= 30%.")
+    print(f"\nPredicted at-risk segment: {int(summary['high_risk_count'])} customers with churn probability >= 70%.")
+    print(f"Predicted safest segment: {int(summary['low_risk_count'])} customers with churn probability <= 30%.")
 
-if __name__ == "__main__":
+
+def save_business_insight_excel(output_path, insight_tables):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet_names = {
+        'summary': 'Summary',
+        'customers': 'Customers',
+        'risky_customers': 'Risky Customers',
+        'clusters': 'Clusters',
+        'products': 'Products',
+        'attention_products': 'Attention Products',
+        'age_segments': 'Age Segments',
+    }
+    with pd.ExcelWriter(output_path) as writer:
+        for key, dataframe in insight_tables.items():
+            dataframe.to_excel(writer, sheet_name=sheet_names[key], index=False)
+
+
+def run_analysis_pipeline(output_path=None):
     df = load_and_merge_data()
-    products_df = pd.read_csv('products 2.csv')
+    products_df = pd.read_csv(_data_path('products 2.csv'))
     customer_data = advanced_feature_engineering(df)
     customer_data = apply_customer_kmeans(customer_data)
-    
-    persona_model_info, persona_feature_cols = train_persona_classifier(customer_data)
+
+    _, _ = train_persona_classifier(customer_data)
     churn_model_info, churn_feature_cols = train_churn_predictor(customer_data)
-    print_business_insights(df, products_df, customer_data, churn_model_info, churn_feature_cols)
+    insight_tables = build_business_insight_tables(df, products_df, customer_data, churn_model_info, churn_feature_cols)
+
+    if output_path:
+        save_business_insight_excel(output_path, insight_tables)
+
+    summary = insight_tables['summary'].iloc[0].to_dict()
+    return {
+        'summary': {
+            'customer_count': int(summary['customer_count']),
+            'churn_rate': float(summary['churn_rate']),
+            'cluster_count': int(summary['cluster_count']),
+            'average_monetary': float(summary['average_monetary']),
+            'high_risk_count': int(summary['high_risk_count']),
+            'low_risk_count': int(summary['low_risk_count']),
+        },
+        'customers': insight_tables['customers'].to_dict(orient='records'),
+        'risky_customers': insight_tables['risky_customers'].to_dict(orient='records'),
+        'clusters': insight_tables['clusters'].to_dict(orient='records'),
+        'products': insight_tables['products'].to_dict(orient='records'),
+        'attention_products': insight_tables['attention_products'].to_dict(orient='records'),
+        'age_segments': insight_tables['age_segments'].to_dict(orient='records'),
+    }
+
+if __name__ == "__main__":
+    payload = run_analysis_pipeline(output_path=_data_path('analysis_results.xlsx'))
+    print(payload['summary'])
